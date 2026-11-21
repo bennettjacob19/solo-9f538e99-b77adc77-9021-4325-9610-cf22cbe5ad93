@@ -5,11 +5,17 @@ Flow for a terminal download request:
 1. The terminal learns the current firmware's strong ETag and length from
    ``GET /firmware/meta`` (visible on the ``/docs`` page).
 2. It requests a byte interval with ``If-Match: <ETag>`` plus ``Range``.
-3. The gateway answers 206 from cached segments, issuing HTTP Range requests
-   to the origin only for missing chunks. If a missing chunk can no longer be
-   completed for that ETag (the origin switched version), the gateway answers
-   **410 before any body bytes are sent**, so the terminal can re-fetch the
-   current version metadata.
+3. The gateway answers 206 from cached segments. Runs of contiguous missing
+   chunks are merged into a single upstream HTTP Range request (at most
+   ``GATEWAY_MAX_BATCH_CHUNKS`` chunks each, default 4), never crossing
+   cached or already in-flight chunks; all batches of one request run
+   concurrently and overlapping concurrent requests share the same in-flight
+   batches. If a missing chunk can no longer be completed for that ETag (the
+   origin switched version), the gateway answers **410 before any body bytes
+   are sent**, so the terminal can re-fetch the current version metadata.
+   A upstream 206 whose ETag, Content-Range or byte count does not match the
+   batch is rejected with **502**, also before any body bytes, and is not
+   cached — the next request retries it.
 """
 
 from __future__ import annotations
@@ -30,11 +36,12 @@ from app.common.firmware import (
     parse_if_match,
     parse_range_header,
 )
-from app.gateway.cache import SegmentCache, VersionGone
+from app.gateway.cache import DEFAULT_MAX_BATCH_CHUNKS, SegmentCache, VersionGone
 
 ORIGIN_BASE_URL = os.getenv("ORIGIN_BASE_URL", "http://origin:8080")
 CHUNK_SIZE = int(os.getenv("GATEWAY_CHUNK_SIZE", str(256 * 1024)))
 REQUEST_TIMEOUT = float(os.getenv("GATEWAY_TIMEOUT", "30"))
+MAX_BATCH_CHUNKS = int(os.getenv("GATEWAY_MAX_BATCH_CHUNKS", str(DEFAULT_MAX_BATCH_CHUNKS)))
 
 
 class UpstreamError(Exception):
@@ -47,9 +54,10 @@ class UpstreamError(Exception):
 def create_app(
     origin_base_url: str = ORIGIN_BASE_URL,
     chunk_size: int = CHUNK_SIZE,
+    max_batch_chunks: int = MAX_BATCH_CHUNKS,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> FastAPI:
-    cache = SegmentCache(chunk_size=chunk_size)
+    cache = SegmentCache(chunk_size=chunk_size, max_batch_chunks=max_batch_chunks)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -119,14 +127,19 @@ def create_app(
             # Keep the probe's payload if useful (first byte of the blob).
             return total
 
-    async def origin_fetch(etag: str, chunk: ByteRange) -> tuple[bytes, int]:
-        """Perform exactly one upstream Range request for one missing chunk."""
+    async def origin_fetch_batch(etag: str, batch: ByteRange) -> tuple[bytes, int]:
+        """Perform one upstream Range request for a merged batch of chunks.
+
+        The 206 response is accepted only if its ETag, Content-Range and body
+        length match this batch exactly; anything else is a 502 towards the
+        terminal and nothing reaches the cache.
+        """
         client: httpx.AsyncClient = app.state.http
         resp = await client.get(
             FIRMWARE_PATH,
             headers={
                 "If-Match": etag,
-                "Range": f"bytes={chunk.start}-{chunk.end}",
+                "Range": f"bytes={batch.start}-{batch.end}",
             },
         )
         if resp.status_code == 412:
@@ -144,8 +157,18 @@ def create_app(
             start, end, total = int(start_text), int(end_text), int(total_text)
         except (ValueError, IndexError):
             raise UpstreamError(502, "origin sent malformed Content-Range")
-        if start != chunk.start or end > chunk.end or len(resp.content) != end - start + 1:
-            raise UpstreamError(502, "origin range does not match the request")
+        if start != batch.start or end != batch.end:
+            raise UpstreamError(
+                502,
+                f"origin Content-Range {start}-{end} does not match "
+                f"batch {batch.start}-{batch.end}",
+            )
+        if len(resp.content) != batch.length:
+            raise UpstreamError(
+                502,
+                f"origin sent {len(resp.content)} bytes, "
+                f"expected {batch.length}",
+            )
         return resp.content, total
 
     @app.get("/", include_in_schema=False)
@@ -154,6 +177,7 @@ def create_app(
             "service": "firmware-gateway",
             "origin": origin_base_url,
             "chunk_size": cache.chunk_size,
+            "max_batch_chunks": cache.max_batch_chunks,
             "docs": "/docs",
             "meta_endpoint": "/firmware/meta",
         }
@@ -254,11 +278,11 @@ def create_app(
                 media_type="application/json",
             )
 
-        async def fetch(chunk: ByteRange) -> tuple[bytes, int]:
-            return await origin_fetch(etag, chunk)
+        async def fetch_batch(batch_range: ByteRange) -> tuple[bytes, int]:
+            return await origin_fetch_batch(etag, batch_range)
 
         try:
-            body = await cache.read_range(etag, byte_range, fetch)
+            body = await cache.read_range(etag, byte_range, fetch_batch)
         except VersionGone:
             return Response(
                 content=(

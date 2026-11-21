@@ -34,6 +34,10 @@ from app.common.firmware import (
 class OriginState:
     active_version: str = VERSIONS[0]
     range_delay: float = 0.0  # seconds, applied to every 206 response
+    # Fault injection: corrupt the next ``corrupt_next`` 206 responses so the
+    # gateway's batch validation (502 + retry) can be exercised end to end.
+    corrupt_next: int = 0
+    corrupt_mode: str = "range"  # "range" | "length" | "etag"
     # Statistics used by the gateway self-tests.
     range_requests: int = 0
     full_requests: int = 0
@@ -96,6 +100,8 @@ def create_app(firmware_length: int | None = None) -> FastAPI:
                 "full_requests": state.full_requests,
                 "precondition_failures": state.precondition_failures,
             },
+            "corrupt_next": state.corrupt_next,
+            "corrupt_mode": state.corrupt_mode,
             "switched_at": state.switched_at,
         }
 
@@ -137,6 +143,33 @@ def create_app(firmware_length: int | None = None) -> FastAPI:
         state.full_requests = 0
         state.precondition_failures = 0
         return {"reset": True}
+
+    @app.post("/admin/corrupt", tags=["admin"])
+    async def set_corrupt(request: Request) -> dict:
+        """Fault injection: corrupt the next ``count`` 206 responses.
+
+        Modes: ``range`` (wrong Content-Range), ``length`` (truncated body),
+        ``etag`` (foreign ETag). Used to verify the gateway rejects bad
+        batches with 502/410 and does not cache them.
+        """
+        body = await request.json()
+        mode = body.get("mode", "range")
+        if mode not in ("range", "length", "etag"):
+            return Response(
+                content='{"detail":"mode must be one of range|length|etag"}',
+                status_code=400,
+                media_type="application/json",
+            )
+        count = int(body.get("count", 1))
+        if count < 0:
+            return Response(
+                content='{"detail":"count must be >= 0"}',
+                status_code=400,
+                media_type="application/json",
+            )
+        state.corrupt_mode = mode
+        state.corrupt_next = count
+        return {"corrupt_next": state.corrupt_next, "corrupt_mode": state.corrupt_mode}
 
     def _precondition_fails(if_match: str | None, etag: str) -> bool:
         """True when the origin must answer 412 for this If-Match."""
@@ -198,13 +231,30 @@ def create_app(firmware_length: int | None = None) -> FastAPI:
 
         state.range_requests += 1
         body = data[byte_range.start:byte_range.end + 1]
+        response_etag = etag
+        content_range = content_range_header(byte_range, size)
+        if state.corrupt_next > 0 and not head:
+            state.corrupt_next -= 1
+            if state.corrupt_mode == "range":
+                # Lie about the range: claim one byte less than requested.
+                content_range = content_range_header(
+                    ByteRange(byte_range.start, byte_range.end - 1), size
+                )
+            elif state.corrupt_mode == "length":
+                # Truncate the body while claiming the full range.
+                body = body[:-1]
+            elif state.corrupt_mode == "etag":
+                # Answer with a foreign version's ETag.
+                other = VERSIONS[1] if version == VERSIONS[0] else VERSIONS[0]
+                response_etag = strong_etag(other)
         return Response(
             content=b"" if head else body,
             status_code=206,
             headers={
                 **common_headers,
-                "Content-Length": str(byte_range.length),
-                "Content-Range": content_range_header(byte_range, size),
+                "ETag": response_etag,
+                "Content-Length": str(len(body)),
+                "Content-Range": content_range,
                 "Content-Type": "application/octet-stream",
                 "X-Origin-Range-Request": "1",
             },
